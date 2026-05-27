@@ -12,9 +12,9 @@ maintainers = [
 ]
 license = { text = "Apache License 2.0" }
 
-dependencies = [
-    "esptool>=5.0.0",
-]
+# dependencies = [
+#     "esptool>=5.0.0",
+# ]
 
 [project.urls]
 Homepage = "https://tetheria.ai"

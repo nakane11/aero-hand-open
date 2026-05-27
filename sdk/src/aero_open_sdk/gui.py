@@ -60,9 +60,9 @@ BAUDS = [
 ]
 
 SLIDER_LABELS = [
-    "thumb_abduction",
-    "thumb_flex",
-    "thumb_tendon",
+    "abduction",
+    "thumb_adduction",
+    "thumb_flexion",
     "index_finger",
     "middle_finger",
     "ring_finger",
