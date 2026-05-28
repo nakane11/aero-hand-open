@@ -10,7 +10,7 @@ struct ServoData {
 
 // 自作ハンド用の設定（ファイルに書くイメージでここを調整してください）
 const int MY_DIRECTIONS[7] = { -1, 1,  1,  -1, 1,  -1, 1}; // 1:正転, -1:逆転
-const int MY_LIMIT_PULSES[7] = {720, 1500, 1350, 1800, 1800, 1750, 1800}; // 可動範囲（パルス幅。最大4095）
+const int MY_LIMIT_PULSES[7] = {505, 1500, 1350, 1800, 1800, 1750, 1800}; // 可動範囲（パルス幅。最大4095）
 
 // Active (mutable) working copy used by the firmware:
 extern ServoData sd[7];

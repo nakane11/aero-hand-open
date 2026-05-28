@@ -126,7 +126,7 @@ class App(tk.Tk):
         self.btn_connect.pack(side=tk.LEFT, padx=(0, 8))
         self.btn_disc = ttk.Button(top, text="Disconnect", command=self.on_disconnect, state=tk.DISABLED)
         self.btn_disc.pack(side=tk.LEFT, padx=(0, 16))
-        
+
         # Streaming rate
         ttk.Label(top, text="Rate (Hz):").pack(side=tk.LEFT)
         self.rate_spin = ttk.Spinbox(top, from_=1, to=200, width=6)
@@ -351,12 +351,21 @@ class App(tk.Tk):
         next_t = time.perf_counter()
         while not self.stop_event.is_set():
             if self.hand is not None and not self.control_paused:
-                # ## Unnormalize to joint limits
-                j_ll = self.hand.joint_lower_limits
-                j_ul = self.hand.joint_upper_limits
-                joint_values = [j_ll[i] + (j_ul[i] - j_ll[i]) * self.slider_vars[i].get() for i in range(7)]
+                # # ## Unnormalize to joint limits
+                # j_ll = self.hand.joint_lower_limits
+                # j_ul = self.hand.joint_upper_limits
+                # joint_values = [j_ll[i] + (j_ul[i] - j_ll[i]) * self.slider_vars[i].get() for i in range(7)]
+                # try:
+                #     self.hand.set_joint_positions(joint_values)
+
+                # joint_limits（関節制限）の代わりに actuation_limits（サーボ可動域制限）を取得
+                a_ll = self.hand.actuation_lower_limits
+                a_ul = self.hand.actuation_upper_limits
+                # 各スライダーの値をサーボ単体の可動域（度）にマッピング
+                actuation_values = [a_ll[i] + (a_ul[i] - a_ll[i]) * self.slider_vars[i].get() for i in range(7)]
                 try:
-                    self.hand.set_joint_positions(joint_values)
+                    # set_joint_positions の代わりに、直接サーボを叩く set_actuations を呼ぶ
+                    self.hand.set_actuations(actuation_values)
                 except Exception as e:
                     self.log(f"[TX error] {e}")
             # pacing
@@ -563,7 +572,7 @@ class App(tk.Tk):
             self.log(f"[GET_TEMP] {list(vals)}")
         except Exception as e:
             self.log(f"[err] GET_TEMP: {e}")
-    
+
     def on_get_all(self):
         if not self.hand:
             return
@@ -619,13 +628,13 @@ class App(tk.Tk):
 
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
-                time.sleep(1.5) 
+                time.sleep(1.5)
                 self.log(f"[flash] Reconnect attempt {attempt}...")
                 result = {'ok': False}
                 done = threading.Event()
                 def _do_connect():
                     try:
-                        ok = bool(self.on_connect()) 
+                        ok = bool(self.on_connect())
                         result['ok'] = ok
                     except Exception as e:
                         self.log(f"[flash] on_connect raised: {e}")
@@ -633,19 +642,19 @@ class App(tk.Tk):
                     finally:
                         done.set()
                 self.after(0, _do_connect)
-                if not done.wait(3.0): 
+                if not done.wait(3.0):
                     self.log("[flash] connect timed out")
-                    continue                   
+                    continue
                 if result['ok']:
                     self.log("[flash] Reconnected ✅")
-                    break                     
+                    break
             else:
                 self.after(0, lambda: self.set_status("Reconnect failed after flashing"))
                 self.after(0, lambda: messagebox.showerror("Flash failed", "Reconnect failed after flashing"))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # ---- to clear RX window 
+    # ---- to clear RX window
     def _clear_rx(self):
         """Clear the RX log text box."""
         try:
