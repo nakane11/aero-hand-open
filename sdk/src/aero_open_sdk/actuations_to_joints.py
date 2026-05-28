@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 from aero_open_sdk.joints_to_actuations import (
     MOTOR_PULLEY_RADIUS,
     FingerCoeffs,
