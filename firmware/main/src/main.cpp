@@ -31,6 +31,7 @@ static const uint8_t GET_CURR  = 0x24;
 static const uint8_t GET_TEMP  = 0x25;
 static const uint8_t SET_SPE   = 0x31;
 static const uint8_t SET_TOR   = 0x32;
+static const uint8_t SET_TRQ_EN = 0x33;
 
 // ---- Defaults for SyncWritePosEx ----
 static uint16_t g_speed[7]  = {32766,32766,32766,32766,32766,32766,32766};
@@ -43,7 +44,7 @@ static int16_t g_lastTorqueCmd[7] = {0};
 
 // ---- Thermal torque limiting (GLOBAL PARAMETERS) ----
 static uint8_t  TEMP_CUTOFF_C    = 70;    // °C cutoff
-static uint16_t HOT_TORQUE_LIMIT = 500;   // clamp torque when motor exceeds TEMP_CUTOFF_C 
+static uint16_t HOT_TORQUE_LIMIT = 500;   // clamp torque when motor exceeds TEMP_CUTOFF_C
 
 // ----- Registers / constants (Mapped as per Feetech Servo HLS3606M) -----
 #define REG_ID                 0x05       // ID register
@@ -99,7 +100,7 @@ static inline uint16_t u16_min(uint16_t a, uint16_t b) { return (a < b) ? a : b;
 
 // ---- Set-ID helpers for setting ID ---
 extern void runReIdScanAndSet(uint8_t Id, uint16_t currentLimit);
-static volatile int g_lastFoundId; 
+static volatile int g_lastFoundId;
 
 // ----- Helper Functions for Set-ID Mode -----
 static bool scanRequireSingleServo(uint8_t* outId, uint8_t requestedNewId) {
@@ -107,12 +108,12 @@ static bool scanRequireSingleServo(uint8_t* outId, uint8_t requestedNewId) {
   int count = 0;
   if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
   for (int id = SCAN_MIN; id <= SCAN_MAX; ++id) {
-    if (id == BROADCAST_ID) continue;        
+    if (id == BROADCAST_ID) continue;
     (void)hlscl.Ping((uint8_t)id);
     if (!hlscl.getLastError()) {
       if (count == 0) first = (uint8_t)id;
       ++count;
-      if (count > 1) break;                    
+      if (count > 1) break;
     }
   }
   if (gBusMux) xSemaphoreGive(gBusMux);
@@ -253,7 +254,7 @@ static inline void sendU16Frame(uint8_t header, const uint16_t data[7]) {
     out[2 + 2*i + 0] = (uint8_t)(data[i] & 0xFF);
     out[2 + 2*i + 1] = (uint8_t)((data[i] >> 8) & 0xFF);
   }
-  Serial.write(out, sizeof(out)); 
+  Serial.write(out, sizeof(out));
 }
 static inline void sendAckFrame(uint8_t header, const uint8_t* payload, size_t n) {
   uint8_t out[16];
@@ -297,7 +298,7 @@ void sendTemps() {
   sendU16Frame(GET_TEMP, buf);
 }
 
-// ----- Task - Sync Read running always on Core 1 ----- 
+// ----- Task - Sync Read running always on Core 1 -----
 static void TaskSyncRead_Core1(void *arg) {
   uint8_t  rx[REG_BLOCK_LEN];          // 15 bytes
   uint16_t pos[7], vel[7], cur[7], tmp[7];
@@ -331,7 +332,7 @@ static void TaskSyncRead_Core1(void *arg) {
         gMetrics.cur[i] = cur[i];
       }
       xSemaphoreGive(gMetricsMux);
-    } 
+    }
     vTaskDelayUntil(&nextWake, period);
   }
 }
@@ -350,8 +351,8 @@ static bool handleSetIdCmd(const uint8_t* payload) {
   }
   // Find any servo present
   uint8_t oldId = 0xFF;
-  if (!scanRequireSingleServo(&oldId, newId)) return true; 
-  
+  if (!scanRequireSingleServo(&oldId, newId)) return true;
+
   if (newId != oldId) {
   if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
   (void)hlscl.Ping(newId);
@@ -372,7 +373,7 @@ static bool handleSetIdCmd(const uint8_t* payload) {
     targetId = newId;
   }
   (void)hlscl.LockEprom(targetId);
-  
+
   // Read back limit for ACK
   uint16_t curLimitRead = 0;
   int rd = hlscl.readWord(targetId, REG_CURRENT_LIMIT);
@@ -476,7 +477,7 @@ static bool handleHostFrame(uint8_t op) {
   switch (op) {
     case CTRL_POS: {
       if (!g_calibrated) return true;
-      
+
       int16_t pos[7];
       for (int i = 0; i < 7; ++i) {
         uint16_t u16 = (uint16_t)payload[2*i] | ((uint16_t)payload[2*i+1] << 8);
@@ -507,48 +508,61 @@ static bool handleHostFrame(uint8_t op) {
       return true;
     }
 
-    case CTRL_TOR: 
+    case CTRL_TOR:
     {
       if (!g_calibrated) return true;
-      
-      int16_t torque_cmd[7]; 
-      for (int i = 0; i < 7; ++i) 
+
+      int16_t torque_cmd[7];
+      for (int i = 0; i < 7; ++i)
       {
-        uint16_t mag = (uint16_t)payload[2*i] | ((uint16_t)payload[2*i + 1] << 8); 
-        if (mag > 1000) mag = 1000; 
+        uint16_t mag = (uint16_t)payload[2*i] | ((uint16_t)payload[2*i + 1] << 8);
+        if (mag > 1000) mag = 1000;
         if (mag < HOLD_MAG) mag = HOLD_MAG;
         if (isHot((uint8_t)i)) {
           mag = u16_min(mag, HOT_TORQUE_LIMIT);
         }
         int grasp_sign = (sd[i].extend_count > sd[i].grasp_count) ? +1 : -1;
         torque_cmd[i] = (int16_t)(grasp_sign * (int)mag);
-      } 
+      }
       for (int i = 0; i < 7; ++i) {
         g_lastTorqueCmd[i] = torque_cmd[i];
       }
 
       if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
 
-      if (g_currentMode != MODE_TORQUE) 
-      { 
-        for (int i = 0; i < 7; ++i) 
-        { 
-          uint8_t id = SERVO_IDS[i]; 
-          hlscl.EleMode(id); 
-        } 
+      if (g_currentMode != MODE_TORQUE)
+      {
+        for (int i = 0; i < 7; ++i)
+        {
+          uint8_t id = SERVO_IDS[i];
+          hlscl.EleMode(id);
+        }
         g_currentMode = MODE_TORQUE;
-      } 
-      for (int i = 0; i < 7; ++i) 
-      { 
-        uint8_t id = SERVO_IDS[i]; 
-        hlscl.WriteEle(id, torque_cmd[i]); 
-      } 
-      if (gBusMux) xSemaphoreGive(gBusMux); 
-      return true; 
+      }
+      for (int i = 0; i < 7; ++i)
+      {
+        uint8_t id = SERVO_IDS[i];
+        hlscl.WriteEle(id, torque_cmd[i]);
+      }
+      if (gBusMux) xSemaphoreGive(gBusMux);
+      return true;
     }
 
     case SET_TOR: {
       return handleSetTorCmd(payload);
+    }
+
+    case SET_TRQ_EN: {
+      uint8_t enable = payload[0]; // 1: ON, 0: OFF(脱力)
+      if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+      for (int i = 0; i < 7; ++i) {
+        // 全サーボのトルクを一括でON/OFF
+        hlscl.EnableTorque(SERVO_IDS[i], enable);
+      }
+      if (gBusMux) xSemaphoreGive(gBusMux);
+
+      sendAckFrame(SET_TRQ_EN, nullptr, 0);
+      return true;
     }
 
     case SET_SPE: {
@@ -636,7 +650,7 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t last_cmd_ms = 0; 
+  static uint32_t last_cmd_ms = 0;
 
   // Gate all host input during homing
   if (HOMING_isBusy()) {

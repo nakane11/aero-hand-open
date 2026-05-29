@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 import os
-import time 
+import time
 import struct
 from serial import Serial, SerialTimeoutException
 from typing import Iterator
@@ -43,6 +43,7 @@ GET_TEMP = 0x25
 ## Setting Modes
 SET_SPE = 0x31
 SET_TOR = 0x32
+SET_TRQ_EN = 0x33
 
 _UINT16_MAX = 65535
 
@@ -78,7 +79,7 @@ class AeroHand:
 
         base_path = '/dev/serial/by-id/'
         esp_32_prefix = 'usb-Espressif_USB_JTAG_serial_debug_unit_'
-        
+
         if not os.path.exists(base_path):
             raise RuntimeError(
                 "Could not find /dev/serial/by-id/.\n"
@@ -86,7 +87,7 @@ class AeroHand:
                 "  → Is this running on Linux? Is the Aero Hand connected?"
                 "If running on Windows, please refer to the documentation to specify the port manually."
             )
-        
+
         detected_ports = [d for d in os.listdir(base_path) if esp_32_prefix in d]
 
         if len(detected_ports) == 0:
@@ -119,7 +120,7 @@ class AeroHand:
             self.set_joint_positions(waypoint)
             time.sleep(0.01)
         return
-    
+
     def convert_seven_joints_to_sixteen(self, positions: list) -> list:
         return [
             positions[0], positions[1], positions[2], positions[2],
@@ -174,7 +175,7 @@ class AeroHand:
         """
 
         return (tendon_extension / MOTOR_PULLEY_RADIUS) * _RAD_TO_DEG
-    
+
     def actuations_to_tendon(self, actuation: float) -> float:
         """
         Convert actuator actuations (degrees) to tendon extension (mm).
@@ -190,7 +191,7 @@ class AeroHand:
         """
         This function is used to set the actuations of the hand directly.
         Use this with caution as Thumb actuations are not independent i.e. setting one
-        actuation requires changes in other actuations. We use the joint to 
+        actuation requires changes in other actuations. We use the joint to
         actuations model to handle this. But this function give you direct access.
         If the actuations are not coupled correctly, it will cause Thumb tendons to
         derail.
@@ -229,18 +230,18 @@ class AeroHand:
         while time.monotonic() < deadline:
             frame = self.ser.read(16)
             if len(frame) != 16:
-                continue 
+                continue
             if frame[0] == (opcode & 0xFF) and frame[1] == 0x00:
                 return frame[2:]
         raise TimeoutError(f"ACK (opcode 0x{opcode:02X}) not received within {timeout_s}s")
-    
+
     def set_id(self, id: int, current_limit: int):
         """This fn is used by the GUI to set actuator IDs and current limits for the first time."""
         if not (0 <= id <= 253):
             raise ValueError("new_id must be 0..253")
         if not (0 <= current_limit <= 1023):
             raise ValueError("current_limit must be in between 0..1023")
-        
+
         try:
             self.ser.reset_input_buffer()
         except Exception:
@@ -253,9 +254,9 @@ class AeroHand:
         payload = self._wait_for_ack(SET_ID_MODE, 5.0)
         old_id, new_id, cur_limit = struct.unpack_from("<HHH", payload, 0)
         return {"Old_id": old_id, "New_id": new_id, "Current_limit": cur_limit}
-    
+
     def set_speed(self, id: int, speed: int):
-        """ 
+        """
         Set the speed of a specific actuator.This speed setting is max by default when the motor moves.
         This is different from speed control mode. It only affect the dynamic of motion execution during position control.
         Args:
@@ -279,7 +280,7 @@ class AeroHand:
         return {"Servo ID": id, "Speed": speed_val}
 
     def set_torque(self, id: int, torque: int):
-        """ 
+        """
          Set the torque of a specific actuator. This torque setting is max by default when the motor moves.
          This is different from torque control mode. It only affect the dynamic of motion execution during position control.
          Args:
@@ -302,13 +303,26 @@ class AeroHand:
         id, torque_val = struct.unpack_from("<HH", payload, 0)
         return {"Servo ID": id, "Torque": torque_val}
 
+    def set_torque_enable(self, enable: bool):
+        """
+        全サーボのトルクをON(True)またはOFF(False: 脱力状態)にする
+        """
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        payload = [0] * 7
+        payload[0] = 1 if enable else 0
+        self._send_data(SET_TRQ_EN, payload)
+        self._wait_for_ack(SET_TRQ_EN, 2.0)
+
     def trim_servo(self, id: int, degrees: int):
         """This fn is used by the GUI to fine tune the actuator positions."""
         if not (0 <= id <= 6):
             raise ValueError("id must be 0..6")
         if not (-360 <= degrees <= 360):
             raise ValueError("degrees out of range")
-        
+
         try:
             self.ser.reset_input_buffer()
         except Exception:
@@ -316,12 +330,12 @@ class AeroHand:
 
         payload = [0] * 7
         payload[0] = id & 0xFFFF
-        payload[1] = degrees & 0xFFFF  
+        payload[1] = degrees & 0xFFFF
         self._send_data(TRIM_MODE, payload)
         payload = self._wait_for_ack(TRIM_MODE, 2.0)
         id, extend = struct.unpack_from("<HH", payload, 0)
         return {"Servo ID": id, "Extend Count": extend}
-    
+
     def ctrl_torque(self, torque: list[int]):
         """
         Set the same torque value for all 7 servos using the CTRL_TOR command.
@@ -346,7 +360,7 @@ class AeroHand:
             self.ser.reset_input_buffer()
         except Exception:
             pass
-        self._send_data(HOMING_MODE) 
+        self._send_data(HOMING_MODE)
         payload = self._wait_for_ack(HOMING_MODE, timeout_s)
         if all(b == 0 for b in payload):
             return True
@@ -358,7 +372,7 @@ class AeroHand:
 
     def get_joint_positions(self):
         raise NotImplementedError("This method is not yet implemented")
-    
+
     def get_joint_positions_compact(self):
         """
         Get the joint positions from the hand in the compact 7 joint representation.
@@ -389,7 +403,7 @@ class AeroHand:
         ## Clear input buffer to avoid stale data
         self.ser.reset_input_buffer()
 
-        try: 
+        try:
             self._send_data(GET_POS)
         except SerialTimeoutException as e:
             print(f"Error while writing to serial port: {e}")
@@ -424,12 +438,12 @@ class AeroHand:
         ## Clear input buffer to avoid stale data
         self.ser.reset_input_buffer()
 
-        try: 
+        try:
             self._send_data(GET_CURR)
         except SerialTimeoutException as e:
             print(f"Error while writing to serial port: {e}")
             return None
-        
+
         ## Read the response, signed values
         resp = self.ser.read(2 + 7 * 2)  # 2
         if len(resp) != 16:
@@ -452,12 +466,12 @@ class AeroHand:
         """
         self.ser.reset_input_buffer()
 
-        try: 
+        try:
             self._send_data(GET_TEMP)
         except SerialTimeoutException as e:
             print(f"Error while writing to serial port: {e}")
             return None
-        
+
         ## Read the response, unsigned values
         resp = self.ser.read(2 + 7 * 2)  # 2
         if len(resp) != 16:
@@ -480,12 +494,12 @@ class AeroHand:
         """
         self.ser.reset_input_buffer()
 
-        try: 
+        try:
             self._send_data(GET_VEL)
         except SerialTimeoutException as e:
             print(f"Error while writing to serial port: {e}")
             return None
-        
+
         ## Read the response, signed values
         resp = self.ser.read(2 + 7 * 2)  # 2
         if len(resp) != 16:

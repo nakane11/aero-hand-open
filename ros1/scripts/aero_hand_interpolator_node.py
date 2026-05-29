@@ -5,6 +5,7 @@ import rospy
 import time
 import threading
 from trajectory_msgs.msg import JointTrajectory
+from std_srvs.srv import SetBool, SetBoolResponse
 from aero_open_sdk.aero_hand import AeroHand
 import serial.tools.list_ports
 
@@ -17,6 +18,7 @@ class AeroHandInterpolatorNode:
 
         rospy.loginfo("AeroHandを初期化中...")
         self.hand = AeroHand(port=self.detect_port())
+        self.hand.ser.flush = lambda: None
         rospy.loginfo("ESP32の起動・初期リセットを待っています (2秒)...")
         time.sleep(2.0)
 
@@ -53,6 +55,7 @@ class AeroHandInterpolatorNode:
         self.start_time = 0.0
         self.duration = 0.0
         self.is_moving = False
+        self.torque_enabled = False
 
         # スレッドセーフのためのロック
         self.lock = threading.Lock()
@@ -63,6 +66,7 @@ class AeroHandInterpolatorNode:
 
         # Goal（目標角と遷移時間）を受け取るSubscriber
         self.sub = rospy.Subscriber('/aero_hand/command', JointTrajectory, self.trajectory_callback)
+        self.srv = rospy.Service('~set_torque_enable', SetBool, self.torque_enable_callback)
 
         rospy.loginfo("AeroHand 補間制御ノードが正常に起動しました。")
         rospy.loginfo("Topic: /aero_hand/command を待機中...")
@@ -76,7 +80,26 @@ class AeroHandInterpolatorNode:
                 return port.device
         return None
 
+    def torque_enable_callback(self, req):
+        with self.lock:
+            try:
+                if req.data:
+                    self.hand.set_torque_enable(True)
+                    self.torque_enabled = True
+                    rospy.loginfo("サーボのトルクをONにしました。")
+                    return SetBoolResponse(success=True, message="Torque ENABLED successfully")
+                else:
+                    self.hand.set_torque_enable(False)
+                    self.torque_enabled = False
+                    self.is_moving = False # 移動中なら補間をストップ
+                    rospy.loginfo("サーボのトルクをOFF（脱力）にしました。")
+                    return SetBoolResponse(success=True, message="Torque DISABLED successfully")
+            except Exception as e:
+                rospy.logerr("トルク切り替えエラー: {}".format(e))
+                return SetBoolResponse(success=False, message=str(e))
+
     def trajectory_callback(self, msg):
+        print(msg)
         """ 目標角と時間を受け取るコールバック関数 """
         if not msg.points:
             rospy.logwarn("受け取ったメッセージにポイントデータが含まれていません。")
@@ -104,6 +127,8 @@ class AeroHandInterpolatorNode:
 
     def update_and_send(self, event):
         """ 100Hzでバックグラウンド実行される計算・送信ループ """
+        if not self.is_moving:
+            return
         with self.lock:
             if self.is_moving:
                 now = time.time()
