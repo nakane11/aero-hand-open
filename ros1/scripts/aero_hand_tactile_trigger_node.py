@@ -3,7 +3,7 @@
 
 import rospy
 import threading
-from std_msgs.msg import Int32MultiArray
+from std_msgs.msg import Int32MultiArray, Bool
 from std_srvs.srv import SetBool, SetBoolRequest
 
 class TactileTriggerNode:
@@ -17,6 +17,10 @@ class TactileTriggerNode:
         rospy.loginfo("Waiting for grasp service (/aero_hand_grasp_service/grasp)...")
         rospy.wait_for_service('/aero_hand_grasp_service/grasp')
         self.grasp_service = rospy.ServiceProxy('/aero_hand_grasp_service/grasp', SetBool)
+
+        self.grasp_pub = rospy.Publisher('/aero_hand/is_grasped', Bool, queue_size=1, latch=True)
+        # Publish initial state (False)
+        self.grasp_pub.publish(Bool(data=False))
 
         self.sub = rospy.Subscriber('/aero_hand/tactile', Int32MultiArray, self.tactile_callback)
         rospy.loginfo(f"Tactile trigger node started. Threshold set to {self.threshold}.")
@@ -44,6 +48,7 @@ class TactileTriggerNode:
             self.is_service_running = True
             req = SetBoolRequest(data=True)
             threading.Thread(target=self.call_service_thread, args=(req,)).start()
+            self.grasp_pub.publish(Bool(data=True))
                 
         elif tactile_sum < self.threshold and self.is_grasped:
             rospy.loginfo(f"Tactile sum ({tactile_sum}) < {self.threshold}. Releasing grasp (False)!")
@@ -51,6 +56,7 @@ class TactileTriggerNode:
             self.is_service_running = True
             req = SetBoolRequest(data=False)
             threading.Thread(target=self.call_service_thread, args=(req,)).start()
+            self.grasp_pub.publish(Bool(data=False))
 
 if __name__ == '__main__':
     try:
