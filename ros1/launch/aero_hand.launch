@@ -1,0 +1,5 @@
+<launch>
+  <node name="aero_hand_interpolator" pkg="aero_hand_open" type="aero_hand_interpolator_node.py" output="screen" />
+  <node name="aero_hand_grasp_service" pkg="aero_hand_open" type="aero_hand_grasp_service.py" output="screen" />
+  <node name="aero_hand_tactile_trigger" pkg="aero_hand_open" type="aero_hand_tactile_trigger_node.py" output="screen" />
+</launch>
