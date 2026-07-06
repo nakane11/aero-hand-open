@@ -39,6 +39,7 @@ GET_POS = 0x22
 GET_VEL = 0x23
 GET_CURR = 0x24
 GET_TEMP = 0x25
+GET_TACTILE = 0x26
 
 ## Setting Modes
 SET_SPE = 0x31
@@ -485,6 +486,34 @@ class AeroHand:
         ## Temperatures are in degree Celsius directly
         temperatures = [float(val) for val in data[2:]]
         return temperatures
+
+    def get_tactile_data(self):
+        """
+        Get the tactile sensor data from the hand.
+        Returns:
+            list: A list of 4 tactile values (CH1, CH2, CH3, CH4).
+        """
+        self.ser.reset_input_buffer()
+
+        try:
+            self._send_data(GET_TACTILE)
+        except SerialTimeoutException as e:
+            print(f"Error while writing to serial port: {e}")
+            return None
+
+        ## Read the response, unsigned values
+        resp = self.ser.read(2 + 7 * 2)  # 16 bytes
+        if len(resp) != 16:
+            print(f"Timeout while reading tactile data. Got {len(resp)} bytes.")
+            return None
+        data = struct.unpack("<2B7H", resp)
+        if data[0] != GET_TACTILE:
+            print(f"Invalid response from hand in get_tactile_data. Expected {GET_TACTILE}, got {data[0]}")
+            self.ser.reset_input_buffer()
+            return None
+        ## We only need the first 4 uint16 values
+        tactile_data = list(data[2:6])
+        return tactile_data
 
     def get_actuator_speeds(self):
         """

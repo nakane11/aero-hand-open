@@ -6,6 +6,7 @@ import time
 import threading
 from trajectory_msgs.msg import JointTrajectory
 from std_srvs.srv import SetBool, SetBoolResponse
+from std_msgs.msg import Int32MultiArray
 from aero_open_sdk.aero_hand import AeroHand
 import serial.tools.list_ports
 
@@ -68,6 +69,9 @@ class AeroHandInterpolatorNode:
         self.sub = rospy.Subscriber('/aero_hand/command', JointTrajectory, self.trajectory_callback)
         self.srv = rospy.Service('~set_torque_enable', SetBool, self.torque_enable_callback)
 
+        # タクタイルセンサー値のPublisher
+        self.tactile_pub = rospy.Publisher('/aero_hand/tactile', Int32MultiArray, queue_size=10)
+
         rospy.loginfo("AeroHand 補間制御ノードが正常に起動しました。")
         rospy.loginfo("Topic: /aero_hand/command を待機中...")
 
@@ -127,6 +131,16 @@ class AeroHandInterpolatorNode:
 
     def update_and_send(self, event):
         """ 100Hzでバックグラウンド実行される計算・送信ループ """
+        # --- タクタイルセンサー値の取得とPublish ---
+        try:
+            tactile_data = self.hand.get_tactile_data()
+            if tactile_data is not None:
+                tactile_msg = Int32MultiArray()
+                tactile_msg.data = tactile_data
+                self.tactile_pub.publish(tactile_msg)
+        except Exception as e:
+            pass # ログが多すぎるのを防ぐため、エラー時は無視
+
         if not self.is_moving:
             return
         with self.lock:

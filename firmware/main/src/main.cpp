@@ -14,6 +14,13 @@ Preferences prefs;
 #define SERIAL2_TX_PIN 3
 #define SERIAL2_RX_PIN 2
 
+// ---- UART pins to the Tactile Sensor (ESP32-S3 XIAO: RX=D7, TX=D6) ----
+#define TACTILE_TX_PIN D6
+#define TACTILE_RX_PIN D7
+
+// ---- Debug / Test Flags ----
+const bool ENABLE_SERVOS = true; // ★サーボを繋がずにセンサだけテストする場合は false にします
+
 // ---- Servo IDs (declare at top) ----
 const uint8_t SERVO_IDS[7] = { 0, 1, 2, 3, 4, 5, 6 };
 
@@ -29,6 +36,7 @@ static const uint8_t GET_POS   = 0x22;
 static const uint8_t GET_VEL   = 0x23;
 static const uint8_t GET_CURR  = 0x24;
 static const uint8_t GET_TEMP  = 0x25;
+static const uint8_t GET_TACTILE = 0x26;
 static const uint8_t SET_SPE   = 0x31;
 static const uint8_t SET_TOR   = 0x32;
 static const uint8_t SET_TRQ_EN = 0x33;
@@ -63,6 +71,9 @@ struct ServoMetrics {
   uint16_t tmp[7];
 };
 static ServoMetrics gMetrics;
+
+static uint16_t gTactileData[4] = {0, 0, 0, 0};
+static SemaphoreHandle_t gTactileMux;
 
 // -------- Global Control Mode State  ---------
 enum ControlMode{
@@ -170,6 +181,8 @@ static void saveExtendsToNVS() {
 // -------- Soft-Limit Safety for Servo motors
 static void checkAndEnforceSoftLimits()
 {
+  if (!ENABLE_SERVOS) return;
+
   static bool torqueLimited[7] = {false};
   static uint32_t lastCheckMs = 0;
   uint32_t now = millis();
@@ -298,6 +311,14 @@ void sendTemps() {
   sendU16Frame(GET_TEMP, buf);
 }
 
+void sendTactile() {
+  uint16_t buf[7] = {0}; // We need 4, pad the rest to use sendU16Frame (which expects 7)
+  if (gTactileMux) xSemaphoreTake(gTactileMux, portMAX_DELAY);
+  for (int i = 0; i < 4; ++i) buf[i] = gTactileData[i];
+  if (gTactileMux) xSemaphoreGive(gTactileMux);
+  sendU16Frame(GET_TACTILE, buf);
+}
+
 // ----- Task - Sync Read running always on Core 1 -----
 static void TaskSyncRead_Core1(void *arg) {
   uint8_t  rx[REG_BLOCK_LEN];          // 15 bytes
@@ -305,6 +326,11 @@ static void TaskSyncRead_Core1(void *arg) {
   const TickType_t period = pdMS_TO_TICKS(10);   // Change Frequency of Running here, 5 -200 Hz, 10-100 Hz, 20 -50 Hz
   TickType_t nextWake = xTaskGetTickCount();
   for (;;) {
+    if (!ENABLE_SERVOS) {
+      vTaskDelayUntil(&nextWake, period);
+      continue;
+    }
+
     // try-lock: if control is using the bus, skip this cycle
     if (gBusMux && xSemaphoreTake(gBusMux, 0) != pdTRUE) {
       vTaskDelayUntil(&nextWake, period);
@@ -336,6 +362,48 @@ static void TaskSyncRead_Core1(void *arg) {
     vTaskDelayUntil(&nextWake, period);
   }
 }
+
+// ----- Task - Tactile Sensor Polling running on Core 0 -----
+static void TaskTactile_Core0(void *arg) {
+  const TickType_t period = pdMS_TO_TICKS(10); // 100Hz
+  TickType_t nextWake = xTaskGetTickCount();
+  byte cmd[1] = {0x6D};
+  unsigned char res[8];
+  
+  for (;;) {
+    Serial1.write(cmd, 1);
+    
+    // Wait slightly for the response
+    uint32_t start_ms = millis();
+    while (Serial1.available() < 8 && (millis() - start_ms) < 5) {
+      vTaskDelay(1);
+    }
+    
+    if (Serial1.available() >= 8) {
+      Serial1.readBytes(res, 8);
+      
+      unsigned int P01L = (unsigned int) res[1];  // CH1 
+      unsigned int P04L = (unsigned int) res[3];  // CH4 
+      unsigned int P02L = (unsigned int) res[5];  // CH2 
+      unsigned int P03L = (unsigned int) res[7];  // CH3 
+      
+      if (gTactileMux) {
+        xSemaphoreTake(gTactileMux, portMAX_DELAY);
+        gTactileData[0] = P01L;
+        gTactileData[1] = P02L;
+        gTactileData[2] = P03L;
+        gTactileData[3] = P04L;
+        xSemaphoreGive(gTactileMux);
+      }
+    }
+    
+    // Flush extra bytes if any
+    while (Serial1.available()) Serial1.read();
+    
+    vTaskDelayUntil(&nextWake, period);
+  }
+}
+
 //Set-ID and Trim Servo functions
 static bool handleSetIdCmd(const uint8_t* payload) {
   // Parse request: two u16 words, little-endian
@@ -495,16 +563,18 @@ static bool handleHostFrame(uint8_t op) {
         torque_eff[i] = base;
       }
 
-      if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
-      if (g_currentMode != MODE_POS) {
-        for (int i = 0; i < 7; ++i) {
-          uint8_t id = SERVO_IDS[i];
-          hlscl.ServoMode(id);
+      if (ENABLE_SERVOS) {
+        if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+        if (g_currentMode != MODE_POS) {
+          for (int i = 0; i < 7; ++i) {
+            uint8_t id = SERVO_IDS[i];
+            hlscl.ServoMode(id);
+          }
+          g_currentMode = MODE_POS;
         }
-        g_currentMode = MODE_POS;
+        hlscl.SyncWritePosEx((uint8_t*)SERVO_IDS, 7, pos, g_speed, g_accel, torque_eff);
+        if (gBusMux) xSemaphoreGive(gBusMux);
       }
-      hlscl.SyncWritePosEx((uint8_t*)SERVO_IDS, 7, pos, g_speed, g_accel, torque_eff);
-      if (gBusMux) xSemaphoreGive(gBusMux);
       return true;
     }
 
@@ -528,23 +598,25 @@ static bool handleHostFrame(uint8_t op) {
         g_lastTorqueCmd[i] = torque_cmd[i];
       }
 
-      if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+      if (ENABLE_SERVOS) {
+        if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
 
-      if (g_currentMode != MODE_TORQUE)
-      {
+        if (g_currentMode != MODE_TORQUE)
+        {
+          for (int i = 0; i < 7; ++i)
+          {
+            uint8_t id = SERVO_IDS[i];
+            hlscl.EleMode(id);
+          }
+          g_currentMode = MODE_TORQUE;
+        }
         for (int i = 0; i < 7; ++i)
         {
           uint8_t id = SERVO_IDS[i];
-          hlscl.EleMode(id);
+          hlscl.WriteEle(id, torque_cmd[i]);
         }
-        g_currentMode = MODE_TORQUE;
+        if (gBusMux) xSemaphoreGive(gBusMux);
       }
-      for (int i = 0; i < 7; ++i)
-      {
-        uint8_t id = SERVO_IDS[i];
-        hlscl.WriteEle(id, torque_cmd[i]);
-      }
-      if (gBusMux) xSemaphoreGive(gBusMux);
       return true;
     }
 
@@ -554,12 +626,14 @@ static bool handleHostFrame(uint8_t op) {
 
     case SET_TRQ_EN: {
       uint8_t enable = payload[0]; // 1: ON, 0: OFF(脱力)
-      if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
-      for (int i = 0; i < 7; ++i) {
-        // 全サーボのトルクを一括でON/OFF
-        hlscl.EnableTorque(SERVO_IDS[i], enable);
+      if (ENABLE_SERVOS) {
+        if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+        for (int i = 0; i < 7; ++i) {
+          // 全サーボのトルクを一括でON/OFF
+          hlscl.EnableTorque(SERVO_IDS[i], enable);
+        }
+        if (gBusMux) xSemaphoreGive(gBusMux);
       }
-      if (gBusMux) xSemaphoreGive(gBusMux);
 
       sendAckFrame(SET_TRQ_EN, nullptr, 0);
       return true;
@@ -570,7 +644,9 @@ static bool handleHostFrame(uint8_t op) {
     }
 
     case HOMING: {
-      HOMING_start();   // blocks
+      if (ENABLE_SERVOS) {
+        HOMING_start();   // blocks
+      }
       saveExtendsToNVS();
       g_calibrated = true;
       sendAckFrame(HOMING, nullptr, 0);
@@ -583,6 +659,11 @@ static bool handleHostFrame(uint8_t op) {
 
     case TRIM: {
       return handleTrimCmd(payload);
+    }
+
+    case GET_TACTILE: {
+      sendTactile();
+      return true;
     }
 
     case GET_POS: {
@@ -620,6 +701,9 @@ void setup() {
   Serial2.begin(1000000, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
   hlscl.pSerial = &Serial2;
 
+  // Tactile Sensor bus UART @ 57600
+  Serial1.begin(57600, SERIAL_8N1, TACTILE_RX_PIN, TACTILE_TX_PIN);
+
   // resetSdToBaseline();
   prefs.begin("hand", false);
   loadManualExtendsFromNVS();
@@ -634,7 +718,9 @@ void setup() {
   }
   if (do_homing) {
     Serial.println("[BOOT] Power-on detected → homing");
-    HOMING_start();
+    if (ENABLE_SERVOS) {
+      HOMING_start();
+    }
     saveExtendsToNVS();
   } else {
     Serial.println("[BOOT] Non-power reset → skipping homing");
@@ -646,7 +732,9 @@ void setup() {
   //Initialisation of Mutex and Task serial pinned to Core 1
   gBusMux =xSemaphoreCreateMutex();
   gMetricsMux = xSemaphoreCreateMutex();
+  gTactileMux = xSemaphoreCreateMutex();
   xTaskCreatePinnedToCore(TaskSyncRead_Core1, "SyncRead", 4096, NULL, 1, NULL, 1); // run on Core1
+  xTaskCreatePinnedToCore(TaskTactile_Core0, "Tactile", 4096, NULL, 1, NULL, 0); // run on Core0
 }
 
 void loop() {
