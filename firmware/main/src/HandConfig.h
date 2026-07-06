@@ -6,11 +6,10 @@
 //   - Arduino CLI:  --build-property compiler.cpp.extra_flags="-DRIGHT_HAND"
 //   - Arduino IDE:  just uncomment one of the lines here.
 
-//#define LEFT_HAND
-#define RIGHT_HAND
-
 #if !defined(LEFT_HAND) && !defined(RIGHT_HAND)
-  #error "Define exactly one: LEFT_HAND or RIGHT_HAND (build flag or uncomment in HandConfig.h)."
+  // Default fallback when not compiled via build flags (e.g. Arduino IDE)
+  //#define LEFT_HAND
+  #define RIGHT_HAND
 #endif
 
 #if defined(LEFT_HAND) && defined(RIGHT_HAND)
