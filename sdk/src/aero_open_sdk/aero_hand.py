@@ -40,11 +40,13 @@ GET_VEL = 0x23
 GET_CURR = 0x24
 GET_TEMP = 0x25
 GET_TACTILE = 0x26
+GET_REG = 0x27
 
 ## Setting Modes
 SET_SPE = 0x31
 SET_TOR = 0x32
 SET_TRQ_EN = 0x33
+SET_REG = 0x34
 
 _UINT16_MAX = 65535
 
@@ -542,6 +544,85 @@ class AeroHand:
         ## Convert to RPM using the conversion factor 1 unit = 0.732 RPM as per Feetech documentation
         speeds_rpm = [val * 0.732 for val in data[2:]]
         return speeds_rpm
+
+    def read_register(self, servo_id: int, addr: int, size: int = 1) -> int:
+        """
+        Read a raw register value directly from a servo (EEPROM or SRAM area).
+
+        This bypasses the interpolator/joint model entirely and talks to the
+        firmware's generic register bridge. Register addresses follow Feetech's
+        magnetic-encoding servo memory table (see aero_open_sdk.param_tool for the
+        confirmed subset used by this hand, e.g. max_temperature_limit=13,
+        max_voltage_limit=14, min_voltage_limit=15, max_torque_limit=16).
+
+        Args:
+            servo_id (int): Bus ID of the servo (0..253)
+            addr (int): Register address (0..255)
+            size (int): 1 (byte) or 2 (word)
+        Returns:
+            int: Raw register value
+        """
+        if not (0 <= servo_id <= 253):
+            raise ValueError("servo_id must be 0..253")
+        if size not in (1, 2):
+            raise ValueError("size must be 1 or 2")
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        payload = [0] * 7
+        payload[0] = servo_id
+        payload[1] = addr & 0xFF
+        payload[2] = size
+        self._send_data(GET_REG, payload)
+        resp = self._wait_for_ack(GET_REG, 2.0)
+        _servo_id, _addr, _size, value, err = struct.unpack_from("<5H", resp, 0)
+        if err:
+            raise RuntimeError(
+                f"Failed to read register {addr} (size {size}) on servo {servo_id}"
+            )
+        return value
+
+    def write_register(self, servo_id: int, addr: int, value: int, size: int = 1) -> int:
+        """
+        Write a raw register value directly to a servo (EEPROM or SRAM area).
+
+        EEPROM writes (addr < 40, per HLSCL.h) are persisted to the servo's
+        non-volatile memory and have a limited write-cycle lifetime -- avoid calling
+        this repeatedly / at high rate for EEPROM addresses.
+
+        Args:
+            servo_id (int): Bus ID of the servo (0..253)
+            addr (int): Register address (0..255)
+            value (int): Value to write
+            size (int): 1 (byte, 0..255) or 2 (word, 0..65535)
+        Returns:
+            int: Value read back from the register after writing, for verification
+        """
+        if not (0 <= servo_id <= 253):
+            raise ValueError("servo_id must be 0..253")
+        if size not in (1, 2):
+            raise ValueError("size must be 1 or 2")
+        max_val = 255 if size == 1 else 65535
+        if not (0 <= value <= max_val):
+            raise ValueError(f"value must be 0..{max_val} for size {size}")
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        payload = [0] * 7
+        payload[0] = servo_id
+        payload[1] = addr & 0xFF
+        payload[2] = size
+        payload[3] = value
+        self._send_data(SET_REG, payload)
+        resp = self._wait_for_ack(SET_REG, 2.0)
+        _servo_id, _addr, _size, readback, err = struct.unpack_from("<5H", resp, 0)
+        if err:
+            raise RuntimeError(
+                f"Failed to write register {addr}={value} (size {size}) on servo {servo_id}"
+            )
+        return readback
 
     def close(self):
         self.ser.close()

@@ -27,3 +27,4 @@ build-backend = "uv_build"
 
 [project.scripts]
 aero-open-gui = "aero_open_sdk.gui:main"
+aero-hand-params = "aero_open_sdk.param_tool:main"

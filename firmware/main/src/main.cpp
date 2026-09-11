@@ -37,9 +37,15 @@ static const uint8_t GET_VEL   = 0x23;
 static const uint8_t GET_CURR  = 0x24;
 static const uint8_t GET_TEMP  = 0x25;
 static const uint8_t GET_TACTILE = 0x26;
+static const uint8_t GET_REG   = 0x27;
 static const uint8_t SET_SPE   = 0x31;
 static const uint8_t SET_TOR   = 0x32;
 static const uint8_t SET_TRQ_EN = 0x33;
+static const uint8_t SET_REG   = 0x34;
+
+// Registers below this address live in EEPROM (per HLSCL.h: TORQUE_ENABLE=40 is the
+// first SRAM register) and require unLockEprom/LockEprom around a write.
+static const uint8_t REG_SRAM_START = 40;
 
 // ---- Defaults for SyncWritePosEx ----
 static uint16_t g_speed[7]  = {32766,32766,32766,32766,32766,32766,32766};
@@ -531,6 +537,77 @@ static bool handleSetTorCmd(const uint8_t* payload)
   return true;
 }
 
+// ----- Generic register read/write (for servo configuration tools) -----
+// Request payload words: [0]=servo bus ID, [1]=register addr, [2]=size(1 or 2 bytes),
+// [3]=value to write (SET_REG only).
+// Response payload words: [0]=servo ID, [1]=addr, [2]=size, [3]=value (read, or
+// read-back after write), [4]=error flag (0 ok, 1 failed/invalid).
+static void sendRegAck(uint8_t header, uint16_t servoId, uint16_t addr, uint16_t size, uint16_t value, uint16_t err) {
+  uint16_t vals[7] = {0};
+  vals[0] = servoId;
+  vals[1] = addr;
+  vals[2] = size;
+  vals[3] = value;
+  vals[4] = err;
+  uint8_t out[14];
+  for (int i = 0; i < 7; ++i) {
+    out[2*i+0] = (uint8_t)(vals[i] & 0xFF);
+    out[2*i+1] = (uint8_t)((vals[i] >> 8) & 0xFF);
+  }
+  sendAckFrame(header, out, sizeof(out));
+}
+
+static bool handleGetRegCmd(const uint8_t* payload) {
+  uint16_t servoId = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+  uint16_t addr    = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+  uint16_t size    = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+
+  uint16_t value = 0;
+  uint16_t err = 1;
+  if (servoId <= 253 && addr <= 255 && (size == 1 || size == 2)) {
+    if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+    int rd = (size == 1) ? hlscl.readByte((uint8_t)servoId, (uint8_t)addr)
+                          : hlscl.readWord((uint8_t)servoId, (uint8_t)addr);
+    if (gBusMux) xSemaphoreGive(gBusMux);
+    if (rd >= 0) {
+      value = (uint16_t)rd;
+      err = 0;
+    }
+  }
+  sendRegAck(GET_REG, servoId, addr, size, value, err);
+  return true;
+}
+
+static bool handleSetRegCmd(const uint8_t* payload) {
+  uint16_t servoId = (uint16_t)payload[0] | ((uint16_t)payload[1] << 8);
+  uint16_t addr    = (uint16_t)payload[2] | ((uint16_t)payload[3] << 8);
+  uint16_t size    = (uint16_t)payload[4] | ((uint16_t)payload[5] << 8);
+  uint16_t value   = (uint16_t)payload[6] | ((uint16_t)payload[7] << 8);
+
+  uint16_t readBack = 0;
+  uint16_t err = 1;
+  uint16_t maxVal = (size == 1) ? 0xFF : 0xFFFF;
+  if (servoId <= 253 && addr <= 255 && (size == 1 || size == 2) && value <= maxVal) {
+    bool isEeprom = (addr < REG_SRAM_START);
+    if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+    if (isEeprom) (void)hlscl.unLockEprom((uint8_t)servoId);
+    int wr = (size == 1) ? hlscl.writeByte((uint8_t)servoId, (uint8_t)addr, (uint8_t)value)
+                         : hlscl.writeWord((uint8_t)servoId, (uint8_t)addr, value);
+    if (isEeprom) (void)hlscl.LockEprom((uint8_t)servoId);
+    if (wr >= 0) {
+      int rd = (size == 1) ? hlscl.readByte((uint8_t)servoId, (uint8_t)addr)
+                            : hlscl.readWord((uint8_t)servoId, (uint8_t)addr);
+      if (rd >= 0) {
+        readBack = (uint16_t)rd;
+        err = 0;
+      }
+    }
+    if (gBusMux) xSemaphoreGive(gBusMux);
+  }
+  sendRegAck(SET_REG, servoId, addr, size, readBack, err);
+  return true;
+}
+
 // ----- Returns true if a valid 16-byte frame was consumed and handled -----
 static bool handleHostFrame(uint8_t op) {
   // Wait until full frame is buffered: filler + 14 payload
@@ -664,6 +741,14 @@ static bool handleHostFrame(uint8_t op) {
     case GET_TACTILE: {
       sendTactile();
       return true;
+    }
+
+    case GET_REG: {
+      return handleGetRegCmd(payload);
+    }
+
+    case SET_REG: {
+      return handleSetRegCmd(payload);
     }
 
     case GET_POS: {
