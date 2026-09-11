@@ -542,6 +542,30 @@ static bool handleSetTorCmd(const uint8_t* payload)
 // [3]=value to write (SET_REG only).
 // Response payload words: [0]=servo ID, [1]=addr, [2]=size, [3]=value (read, or
 // read-back after write), [4]=error flag (0 ok, 1 failed/invalid).
+
+// The sync-read task reads with a hard deadline (syncTimeOut) and can return while
+// the tail of a servo response is still on the wire; the library's own flush only
+// drains bytes that have already landed. Absorb the stragglers here, or the reply
+// parse of a point-to-point transaction desyncs and always fails.
+static void settleServoBus() {
+  for (int i = 0; i < 5; ++i) {
+    vTaskDelay(pdMS_TO_TICKS(1));
+    if (!Serial2.available()) return;
+    while (Serial2.available()) Serial2.read();
+  }
+}
+
+// Returns the register value, or -1 if the servo did not answer.
+static int readServoRegister(uint8_t servoId, uint8_t addr, uint8_t size) {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    settleServoBus();
+    int rd = (size == 1) ? hlscl.readByte(servoId, addr)
+                         : hlscl.readWord(servoId, addr);
+    if (rd >= 0) return rd;
+  }
+  return -1;
+}
+
 static void sendRegAck(uint8_t header, uint16_t servoId, uint16_t addr, uint16_t size, uint16_t value, uint16_t err) {
   uint16_t vals[7] = {0};
   vals[0] = servoId;
@@ -566,8 +590,7 @@ static bool handleGetRegCmd(const uint8_t* payload) {
   uint16_t err = 1;
   if (servoId <= 253 && addr <= 255 && (size == 1 || size == 2)) {
     if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
-    int rd = (size == 1) ? hlscl.readByte((uint8_t)servoId, (uint8_t)addr)
-                          : hlscl.readWord((uint8_t)servoId, (uint8_t)addr);
+    int rd = readServoRegister((uint8_t)servoId, (uint8_t)addr, (uint8_t)size);
     if (gBusMux) xSemaphoreGive(gBusMux);
     if (rd >= 0) {
       value = (uint16_t)rd;
@@ -590,13 +613,13 @@ static bool handleSetRegCmd(const uint8_t* payload) {
   if (servoId <= 253 && addr <= 255 && (size == 1 || size == 2) && value <= maxVal) {
     bool isEeprom = (addr < REG_SRAM_START);
     if (gBusMux) xSemaphoreTake(gBusMux, portMAX_DELAY);
+    settleServoBus();
     if (isEeprom) (void)hlscl.unLockEprom((uint8_t)servoId);
     int wr = (size == 1) ? hlscl.writeByte((uint8_t)servoId, (uint8_t)addr, (uint8_t)value)
                          : hlscl.writeWord((uint8_t)servoId, (uint8_t)addr, value);
     if (isEeprom) (void)hlscl.LockEprom((uint8_t)servoId);
     if (wr >= 0) {
-      int rd = (size == 1) ? hlscl.readByte((uint8_t)servoId, (uint8_t)addr)
-                            : hlscl.readWord((uint8_t)servoId, (uint8_t)addr);
+      int rd = readServoRegister((uint8_t)servoId, (uint8_t)addr, (uint8_t)size);
       if (rd >= 0) {
         readBack = (uint16_t)rd;
         err = 0;

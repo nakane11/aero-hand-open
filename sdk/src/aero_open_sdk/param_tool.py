@@ -109,6 +109,25 @@ def cmd_get(args):
         hand.close()
 
 
+def cmd_dump(args):
+    """Read every known register for one servo ID (or all 7 if --id is omitted)."""
+    hand = AeroHand(port=args.port)
+    try:
+        ids = [args.id] if args.id is not None else list(range(7))
+        items = sorted(KNOWN_REGISTERS.items(), key=lambda kv: kv[1][0])
+        for servo_id in ids:
+            print(f"=== servo {servo_id} ===")
+            print(f"{'name':<22}{'addr':>6}{'size':>6}  {'area':<9}value")
+            for name, (addr, size, area) in items:
+                try:
+                    value = hand.read_register(servo_id, addr, size)
+                    print(f"{name:<22}{addr:>6}{size:>6}  {area:<9}{value}")
+                except Exception as e:
+                    print(f"{name:<22}{addr:>6}{size:>6}  {area:<9}ERROR: {e}", file=sys.stderr)
+    finally:
+        hand.close()
+
+
 def cmd_set(args):
     if args.id is None:
         raise SystemExit("--id is required for 'set' (writing all servos at once is not supported)")
@@ -158,6 +177,10 @@ def build_parser():
     add_target_args(p_get)
     p_get.add_argument("--id", type=int, default=None, help="Servo bus ID (0..253)")
     p_get.set_defaults(func=cmd_get)
+
+    p_dump = sub.add_parser("dump", help="Read every known register for one servo (all 7 if --id is omitted)")
+    p_dump.add_argument("--id", type=int, default=None, help="Servo bus ID (0..253); all 7 if omitted")
+    p_dump.set_defaults(func=cmd_dump)
 
     p_set = sub.add_parser("set", help="Write a register on one servo")
     add_target_args(p_set)
