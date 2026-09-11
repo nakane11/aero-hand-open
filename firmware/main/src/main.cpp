@@ -50,7 +50,7 @@ static const uint8_t REG_SRAM_START = 40;
 // ---- Defaults for SyncWritePosEx ----
 static uint16_t g_speed[7]  = {32766,32766,32766,32766,32766,32766,32766};
 static uint8_t  g_accel[7]  = {0,0,0,0,0,0,0};     // 0..255
-static uint16_t g_torque[7] = {700,700,700,700,700,700,700}; // 0....1000
+static uint16_t g_torque[7] = {900,900,900,900,900,900,900}; // 0....1000
 static const uint16_t HOLD_MAG = 5;       // the minimal torque actually commanded to the motors during the torque mode. Any torque below that will not be used.
 
 // Last commanded torque per servo (signed)
