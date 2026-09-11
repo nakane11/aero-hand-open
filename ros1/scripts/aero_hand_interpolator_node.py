@@ -4,9 +4,6 @@
 import rospy
 import time
 import threading
-import os
-import json
-import datetime
 from trajectory_msgs.msg import JointTrajectory
 from std_srvs.srv import SetBool, SetBoolResponse
 from std_msgs.msg import Int32MultiArray, Float32MultiArray
@@ -78,7 +75,6 @@ class AeroHandInterpolatorNode:
         # --- サーボ状態（位置・速度・電流・温度）の定期取得 ---
         # 温度・電流は他ノード（過熱時の安全停止、トルク相当値の記録など）が使えるよう
         # 常時 /aero_hand/temperature, /aero_hand/current にpublishする。
-        # JSON Linesへの記録は ~status_log_enable が真の場合のみ行う。
         self.temperature_pub = rospy.Publisher(
             '/aero_hand/temperature', Float32MultiArray, queue_size=1
         )
@@ -86,21 +82,7 @@ class AeroHandInterpolatorNode:
             '/aero_hand/current', Float32MultiArray, queue_size=1
         )
 
-        self.status_log_file = None
-        self.status_log_enable = rospy.get_param('~status_log_enable', True)
         self.status_poll_rate = rospy.get_param('~status_poll_rate', 1.0)  # Hz
-
-        if self.status_log_enable:
-            log_dir = os.path.expanduser(
-                rospy.get_param('~status_log_dir', '~/.ros/aero_hand_logs')
-            )
-            os.makedirs(log_dir, exist_ok=True)
-            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            self.status_log_path = os.path.join(log_dir, f'aero_hand_status_{ts}.jsonl')
-            self.status_log_file = open(self.status_log_path, 'a')
-            rospy.loginfo(f"サーボ状態ログを記録します: {self.status_log_path}")
-            rospy.on_shutdown(self._close_status_log)
-
         if self.status_poll_rate > 0:
             self.status_timer = rospy.Timer(
                 rospy.Duration(1.0 / self.status_poll_rate), self.poll_status
@@ -164,13 +146,10 @@ class AeroHandInterpolatorNode:
         rospy.loginfo("新しい目標を受信: {} を {} 秒かけて動かします。".format(self.target_values, tgt_duration))
 
     def poll_status(self, event):
-        """ 低頻度でサーボの位置・速度・電流・温度を取得する。
-            温度・電流は常に /aero_hand/temperature, /aero_hand/current にpublishし、
-            status_log_enable が真の場合はJSON Linesにも記録する。 """
+        """ 低頻度でサーボの電流・温度を取得し、
+            /aero_hand/temperature, /aero_hand/current にpublishする。 """
         with self.lock:
             try:
-                positions = self.hand.get_actuations()
-                speeds = self.hand.get_actuator_speeds()
                 currents = self.hand.get_actuator_currents()
                 temperatures = self.hand.get_actuator_temperatures()
             except Exception as e:
@@ -186,29 +165,6 @@ class AeroHandInterpolatorNode:
             current_msg = Float32MultiArray()
             current_msg.data = currents
             self.current_pub.publish(current_msg)
-
-        if self.status_log_file is None:
-            return
-        record = {
-            "stamp": rospy.Time.now().to_sec(),
-            "time": datetime.datetime.now().isoformat(),
-            "position_deg": positions,
-            "speed_rpm": speeds,
-            "current_mA": currents,
-            "temperature_C": temperatures,
-        }
-        try:
-            self.status_log_file.write(json.dumps(record) + "\n")
-            self.status_log_file.flush()
-        except Exception as e:
-            rospy.logwarn_throttle(10, "サーボ状態ログの書き込みエラー: {}".format(e))
-
-    def _close_status_log(self):
-        if self.status_log_file is not None:
-            try:
-                self.status_log_file.close()
-            except Exception:
-                pass
 
     def update_and_send(self, event):
         """ 100Hzでバックグラウンド実行される計算・送信ループ """

@@ -102,17 +102,17 @@ class ThermalAwareGraspToggler:
             rospy.logwarn_throttle(10, 'ログ書き込みエラー: {}'.format(e))
 
     def _call_grasp(self, data):
+        # data (true/false) を送る直前の温度・電流を記録する
+        self._log(is_grasping=data)
         try:
             res = self.grasp(data=data)
             rospy.loginfo('data=%s -> success=%s, message="%s"', data, res.success, res.message)
         except rospy.ServiceException as e:
             rospy.logwarn('service call failed: %s', e)
-        self._log(is_grasping=data)
 
     def run(self):
         data = False
         rate = rospy.Rate(1.0 / self.interval)
-        watch_rate = rospy.Rate(1.0)  # 過熱で待機中はこの周期で温度を再チェックする
         while not rospy.is_shutdown():
             if self.is_overheated():
                 if data:
@@ -125,7 +125,7 @@ class ThermalAwareGraspToggler:
                     data = False
                 else:
                     self._log(is_grasping=False)
-                watch_rate.sleep()
+                rate.sleep()
                 continue
 
             self._call_grasp(data)
