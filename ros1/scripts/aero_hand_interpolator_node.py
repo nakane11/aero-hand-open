@@ -7,12 +7,15 @@ import time
 import threading
 from trajectory_msgs.msg import JointTrajectory
 from std_srvs.srv import SetBool, SetBoolResponse
-from std_msgs.msg import Int32MultiArray, Float32MultiArray
+from std_msgs.msg import Int32MultiArray, Float32MultiArray, Float32
 from aero_open_sdk.aero_hand import AeroHand
 import serial.tools.list_ports
 
 # 位置制御コマンドのコード
 CTRL_POS = 0x11
+
+# サーボの現在電圧レジスタ (HLSCL_PRESENT_VOLTAGE, 1byte, 0.1V単位)
+REG_PRESENT_VOLTAGE = 62
 
 class AeroHandInterpolatorNode:
     def __init__(self):
@@ -60,6 +63,21 @@ class AeroHandInterpolatorNode:
         self.current_pub = rospy.Publisher(
             '/aero_hand/current', Float32MultiArray, queue_size=1
         )
+
+        # --- バッテリ電圧の推定 ---
+        # 各サーボの電圧値は0.1V刻みで個体ごとに±0.1V程度ばらつき、
+        # 時々外れ値も出るため、最大・最小を除いた平均（トリム平均）を取り、
+        # さらに指数移動平均で時間方向に平滑化して1つの値としてpublishする。
+        self.battery_voltage_pub = rospy.Publisher(
+            '/aero_hand/battery_voltage', Float32, queue_size=1
+        )
+        # 指数移動平均の係数 (1.0で平滑化なし。1Hz・0.2で時定数約5秒)
+        self.battery_filter_alpha = rospy.get_param('~battery_filter_alpha', 0.2)
+        self.battery_voltage = None
+        # 指の動作中・動作直後は電圧が下がる上、レジスタ読み出しで送信ループが
+        # 待たされて動きがカクつくため、動作終了からこの秒数が経つまでは測らない
+        self.battery_settle_time = rospy.get_param('~battery_settle_time', 1.0)
+        self.last_motion_time = 0.0
 
         self.status_poll_rate = rospy.get_param('~status_poll_rate', 1.0)  # Hz
         if self.status_poll_rate > 0:
@@ -130,6 +148,7 @@ class AeroHandInterpolatorNode:
             self.is_moving = False
             self.torque_enabled = False
             self.error_count = 0
+            self.battery_voltage = None
             self.connected_port = port
             self.hand = hand
 
@@ -237,8 +256,8 @@ class AeroHandInterpolatorNode:
         rospy.loginfo("新しい目標を受信: {} を {} 秒かけて動かします。".format(self.target_values, tgt_duration))
 
     def poll_status(self, event):
-        """ 低頻度でサーボの電流・温度を取得し、
-            /aero_hand/temperature, /aero_hand/current にpublishする。 """
+        """ 低頻度でサーボの電流・温度・電圧を取得し、
+            /aero_hand/temperature, /aero_hand/current, /aero_hand/battery_voltage にpublishする。 """
         with self.lock:
             if self.hand is None:
                 return
@@ -249,6 +268,18 @@ class AeroHandInterpolatorNode:
                 rospy.logwarn_throttle(10, "サーボ状態の取得エラー: {}".format(e))
                 return
 
+            volts = []
+            if not self.is_moving and time.time() - self.last_motion_time >= self.battery_settle_time:
+                for servo_id in range(7):
+                    try:
+                        volts.append(self.hand.read_register(servo_id, REG_PRESENT_VOLTAGE, 1) * 0.1)
+                    except Exception as e:
+                        rospy.logwarn_throttle(10, "サーボ{}の電圧取得エラー: {}".format(servo_id, e))
+
+        voltage = self.estimate_battery_voltage(volts)
+        if voltage is not None:
+            self.battery_voltage_pub.publish(Float32(data=voltage))
+
         if temperatures is not None:
             temp_msg = Float32MultiArray()
             temp_msg.data = temperatures
@@ -258,6 +289,22 @@ class AeroHandInterpolatorNode:
             current_msg = Float32MultiArray()
             current_msg.data = currents
             self.current_pub.publish(current_msg)
+
+    def estimate_battery_voltage(self, volts):
+        """ 各サーボの電圧値からバッテリ電圧を推定する """
+        if not volts:
+            return None
+        volts = sorted(volts)
+        if len(volts) >= 3:
+            volts = volts[1:-1]  # 最大・最小（外れ値）を除外
+        sample = sum(volts) / len(volts)
+
+        if self.battery_voltage is None:
+            self.battery_voltage = sample
+        else:
+            a = self.battery_filter_alpha
+            self.battery_voltage = a * sample + (1.0 - a) * self.battery_voltage
+        return self.battery_voltage
 
     def update_and_send(self, event):
         """ 100Hzでバックグラウンド実行される計算・送信ループ """
@@ -304,6 +351,7 @@ class AeroHandInterpolatorNode:
             try:
                 # ESP32へダイレクト送信
                 self.hand._send_data(CTRL_POS, payload)
+                self.last_motion_time = time.time()
             except Exception as e:
                 self.error_count += 1
                 rospy.logerr_throttle(1, "ESP32への送信エラー: {}".format(e))
