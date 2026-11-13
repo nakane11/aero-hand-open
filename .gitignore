@@ -4,5 +4,6 @@ __pycache__/
 build/
 .colcon/
 .DS_Store
+.pio/
 
 .vscode/
