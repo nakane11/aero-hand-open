@@ -21,6 +21,20 @@ xy 平面に射影した方向へ cmd_vel を送る.
 センサ途絶 (timeout) や TF 取得失敗のときは 0 を送り, オフにしたら 0 を 1 回送って以降は送らない.
 BTN 行が btn_timeout 秒届かなければ (USB 抜け, ファームウェア停止など) 自動でオフにする.
 再びオンにするにはボタンを押し直す.
+
+引いた方向は前後左右の並進に使う (~allow_lateral, 既定 True).
+回転は画像認識で求めた人の体の向き (~body_yaw_topic, aero_demo の
+human_body_yaw_node.py が出す geometry_msgs/PoseStamped) に台車の向きを揃える
+(~enable_body_rotation):
+- 向きの差が rot_start_angle を超えた状態が rot_start_delay 秒続いたら回り始め,
+  rot_stop_angle を下回ったら止まる (ヒステリシス).
+- 角速度は 向きの差 x rot_gain (上限 max_rot_vel), 角加速度は max_rot_accel で制限する.
+- 回っている間も引きによる並進は止めない. 回転の中心は ~rotation_center
+  ('hand': つないでいる手 (~frame_id), 'base': 台車の中心). 'hand' のときは
+  v = -omega x r の並進を足して, 回っても手の位置が動かないようにする.
+- 向きが body_yaw_timeout 秒届かなければ回転だけ 0 にする.
+向きのメッセージは撮影時刻の odom 座標系で届くので, 最新の TF で base_link に直して
+使う (画像の遅れの間に台車が回っても回りすぎない).
 """
 
 import math
@@ -30,9 +44,72 @@ import numpy as np
 import rospy
 import serial
 import tf2_ros
-from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool
+from geometry_msgs.msg import PoseStamped, Twist
+from std_msgs.msg import Bool, Float32
 from tf.transformations import quaternion_matrix
+
+
+def wrap_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def yaw_from_quaternion(q):
+    """クォータニオン (x, y, z, w を持つもの) のヨー角."""
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def rotation_compensation(omega, r):
+    """台車の中心から r (xy) にある点を中心に omega で回るための並進 v = -omega x r."""
+    return np.array([omega * r[1], -omega * r[0]])
+
+
+class BodyYawRotation:
+    """人の体の向きとの差 (向きの差) から台車の角速度を決める (ROS 非依存).
+
+    向きの差が start_angle を超えた状態が start_delay 秒続いたら回り始め,
+    stop_angle を下回ったら止まる. 角速度は gain x 向きの差 (上限 max_vel),
+    変化は max_accel [rad/s^2] で制限する.
+    """
+
+    def __init__(self, start_angle, stop_angle, start_delay, gain, max_vel, max_accel):
+        self.start_angle = start_angle
+        self.stop_angle = min(stop_angle, start_angle)
+        self.start_delay = start_delay
+        self.gain = gain
+        self.max_vel = max_vel
+        self.max_accel = max_accel
+        self.reset()
+
+    def reset(self):
+        self.rotating = False
+        self.over_since = None
+        self.omega = 0.0
+
+    def update(self, error, now, dt):
+        """error: 向きの差 [rad] (base_link から見た人の向き, 無ければ None), now: 時刻 [s]."""
+        target = 0.0
+        if error is None:
+            self.rotating = False
+            self.over_since = None
+        else:
+            a = abs(error)
+            if self.rotating:
+                if a < self.stop_angle:
+                    self.rotating = False
+                    self.over_since = None
+            elif a > self.start_angle:
+                if self.over_since is None:
+                    self.over_since = now
+                if now - self.over_since >= self.start_delay:
+                    self.rotating = True
+            else:
+                self.over_since = None
+            if self.rotating:
+                target = float(np.clip(self.gain * error, -self.max_vel, self.max_vel))
+        step = self.max_accel * dt
+        self.omega += float(np.clip(target - self.omega, -step, step))
+        return self.omega
 
 
 class MagneticCmdVelNode:
@@ -53,7 +130,8 @@ class MagneticCmdVelNode:
         # 左右より傾きにくく, 同じように引いても速度が左右の約 0.7 倍だったため 1.5 倍にする
         self.gain_x = rospy.get_param('~gain_x', 1.5)
         self.max_linear_vel = rospy.get_param('~max_linear_vel', 0.4)  # m/s
-        self.allow_lateral = rospy.get_param('~allow_lateral', False)  # 全方向台車なら True
+        # 全方向台車なら True (横に引くと横へ動く). False なら横に引くと旋回する
+        self.allow_lateral = rospy.get_param('~allow_lateral', True)
         self.max_angular_vel = rospy.get_param('~max_angular_vel', 0.7)  # rad/s (allow_lateral=False 時)
         self.direction_sign = rospy.get_param('~direction_sign', 1.0)  # 引く方向と逆に動く場合は -1
         self.snap_angle = rospy.get_param('~snap_angle', 20.0)     # deg (0 で無効)
@@ -70,6 +148,34 @@ class MagneticCmdVelNode:
         # vx = map_x[0]*hand_x + map_x[1]*hand_y, vy = map_y[0]*hand_x + map_y[1]*hand_y
         self.map_x = rospy.get_param('~map_x', [1.0, 0.0])
         self.map_y = rospy.get_param('~map_y', [0.0, 1.0])
+
+        # 人の体の向きに台車の向きを揃える回転
+        self.enable_body_rotation = rospy.get_param('~enable_body_rotation', True)
+        self.body_yaw_topic = rospy.get_param('~body_yaw_topic', '/human_body_yaw/body_pose')
+        self.body_yaw_timeout = rospy.get_param('~body_yaw_timeout', 0.5)  # s (受信からの経過)
+        self.rotation_center = rospy.get_param('~rotation_center', 'hand')  # 'hand' or 'base'
+        # 並進 (引き + 回転の補正) の合計の上限
+        self.max_total_linear_vel = rospy.get_param('~max_total_linear_vel', 0.5)  # m/s
+        self.rotation = BodyYawRotation(
+            start_angle=math.radians(rospy.get_param('~rot_start_angle', 15.0)),
+            stop_angle=math.radians(rospy.get_param('~rot_stop_angle', 5.0)),
+            start_delay=rospy.get_param('~rot_start_delay', 0.5),
+            gain=rospy.get_param('~rot_gain', 1.0),                  # (rad/s) / rad
+            max_vel=rospy.get_param('~max_rot_vel', 0.35),           # rad/s
+            max_accel=rospy.get_param('~max_rot_accel', 0.5))        # rad/s^2
+        if self.enable_body_rotation and not self.allow_lateral:
+            rospy.logwarn("enable_body_rotation needs allow_lateral=True "
+                          "(the lateral pull is used for turning). Body rotation disabled.")
+            self.enable_body_rotation = False
+        if self.enable_body_rotation and not self.use_tf:
+            rospy.logwarn("enable_body_rotation needs use_tf=True. Body rotation disabled.")
+            self.enable_body_rotation = False
+        if self.rotation_center not in ('hand', 'base'):
+            rospy.logwarn(f"Unknown rotation_center '{self.rotation_center}', using 'hand'.")
+            self.rotation_center = 'hand'
+        self.body_yaw_lock = threading.Lock()
+        self.body_yaw_msg = None
+        self.body_yaw_recv = None  # 受信時刻 (PC とロボットの時計のずれに左右されないよう受信側の時計)
 
         self.lock = threading.Lock()
         self.toggle_lock = threading.Lock()
@@ -93,6 +199,11 @@ class MagneticCmdVelNode:
         self.cmd_pub = rospy.Publisher('cmd_vel', Twist, queue_size=1)
         self.active_pub = rospy.Publisher('~active', Bool, queue_size=1, latch=True)
         self.active_pub.publish(Bool(data=False))
+        # デバッグ用: 向きの差 [deg] (人の向き - 台車の向き) と回転中か
+        self.yaw_error_pub = rospy.Publisher('~body_yaw_error', Float32, queue_size=1)
+        self.rotating_pub = rospy.Publisher('~rotating', Bool, queue_size=1)
+        if self.enable_body_rotation:
+            rospy.Subscriber(self.body_yaw_topic, PoseStamped, self.body_yaw_callback, queue_size=1)
 
         try:
             self.ser = serial.Serial(self.serial_port, self.baud_rate, timeout=1.0)
@@ -115,7 +226,14 @@ class MagneticCmdVelNode:
         rospy.loginfo(f"Parameters -> dead_zone: {self.dead_zone}/{self.dead_zone_release} deg, max_tilt: {self.max_tilt} deg, "
                       f"max_vel: {self.max_linear_vel} m/s, snap: {self.snap_angle} deg, "
                       f"accel/decel: {self.max_accel}/{self.max_decel} m/s^2, btn_timeout: {self.btn_timeout} s, "
-                      f"use_tf: {self.use_tf}, base_frame: {self.base_frame}")
+                      f"use_tf: {self.use_tf}, base_frame: {self.base_frame}, "
+                      f"allow_lateral: {self.allow_lateral}")
+        if self.enable_body_rotation:
+            r = self.rotation
+            rospy.loginfo(f"Body rotation -> topic: {self.body_yaw_topic}, "
+                          f"start/stop: {math.degrees(r.start_angle):.0f}/{math.degrees(r.stop_angle):.0f} deg "
+                          f"after {r.start_delay} s, gain: {r.gain}, max: {r.max_vel} rad/s, "
+                          f"accel: {r.max_accel} rad/s^2, center: {self.rotation_center}")
 
     # ---------------- ボタンによるオン/オフ ----------------
     def fw_button_callback(self, state):
@@ -218,6 +336,49 @@ class MagneticCmdVelNode:
             except Exception as e:
                 rospy.logerr(f"Unexpected error: {e}")
 
+    # ---------------- 人の体の向き ----------------
+    def body_yaw_callback(self, msg):
+        with self.body_yaw_lock:
+            self.body_yaw_msg = msg
+            self.body_yaw_recv = rospy.Time.now()
+
+    def lookup_base_from(self, frame):
+        """base_frame <- frame の最新の TF (取れなければ None)."""
+        try:
+            return self.tf_buffer.lookup_transform(self.base_frame, frame, rospy.Time(0),
+                                                   rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn_throttle(2.0, f"TF {frame} -> {self.base_frame} failed: {e}")
+            return None
+
+    def body_yaw_error(self):
+        """base_frame から見た人の体の向き [rad] (= 台車が回るべき角度). 無ければ None."""
+        with self.body_yaw_lock:
+            msg = self.body_yaw_msg
+            recv = self.body_yaw_recv
+        if msg is None or recv is None:
+            return None
+        if (rospy.Time.now() - recv).to_sec() > self.body_yaw_timeout:
+            rospy.logwarn_throttle(5.0, "Body yaw timed out. Not rotating.")
+            return None
+        yaw = yaw_from_quaternion(msg.pose.orientation)
+        if msg.header.frame_id and msg.header.frame_id != self.base_frame:
+            t = self.lookup_base_from(msg.header.frame_id)
+            if t is None:
+                return None
+            yaw += yaw_from_quaternion(t.transform.rotation)
+        return wrap_angle(yaw)
+
+    def rotation_center_xy(self):
+        """回転の中心 (base_frame の xy). 取れなければ None."""
+        if self.rotation_center == 'base':
+            return np.zeros(2)
+        t = self.lookup_base_from(self.hand_frame)
+        if t is None:
+            return None
+        return np.array([t.transform.translation.x, t.transform.translation.y])
+
     # ---------------- cmd_vel 出力 ----------------
     def hand_to_base(self, d):
         """ハンド座標系のベクトルをベース座標系の xy 成分に変換."""
@@ -308,17 +469,42 @@ class MagneticCmdVelNode:
                 self.pulling = False
                 rospy.logwarn_throttle(2.0, "Sensor data timed out. Stopping.")
 
-        self.filtered_cmd = self.rate_limit(target, 1.0 / self.rate_hz)
+        dt = 1.0 / self.rate_hz
+        self.filtered_cmd = self.rate_limit(target, dt)
+
+        omega, linear = self.body_rotation(dt)
+        linear = linear + self.filtered_cmd
 
         # オンの間は止まっているとき (不感帯内, キャリブレーション中, TF 取得失敗,
         # センサ途絶) も含めて常に publish する
-        self.cmd_pub.publish(self.make_twist(self.filtered_cmd))
+        self.cmd_pub.publish(self.make_twist(linear, omega))
 
-    def make_twist(self, v):
+    def body_rotation(self, dt):
+        """人の体の向きに揃える角速度と, 回転の中心を保つための並進 (base_frame の xy)."""
+        if not self.enable_body_rotation:
+            return 0.0, np.zeros(2)
+        error = self.body_yaw_error()
+        center = self.rotation_center_xy() if error is not None else None
+        if center is None:
+            error = None  # 手の位置が分からなければ手を中心に回せないので回さない
+        omega = self.rotation.update(error, rospy.Time.now().to_sec(), dt)
+        if error is not None:
+            self.yaw_error_pub.publish(Float32(data=math.degrees(error)))
+        self.rotating_pub.publish(Bool(data=self.rotation.rotating))
+        if center is None:
+            # 止まるまでの減速中は台車の中心で回る
+            return omega, np.zeros(2)
+        return omega, rotation_compensation(omega, center)
+
+    def make_twist(self, v, omega=0.0):
         twist = Twist()
         if self.allow_lateral:
+            n = np.linalg.norm(v)
+            if n > self.max_total_linear_vel > 0:
+                v = v * (self.max_total_linear_vel / n)
             twist.linear.x = v[0]
             twist.linear.y = v[1]
+            twist.angular.z = omega
         else:
             # 差動二輪: 前後成分で並進, 横成分で旋回
             twist.linear.x = v[0]
@@ -329,6 +515,7 @@ class MagneticCmdVelNode:
     def stop(self):
         self.filtered_cmd = np.zeros(2)
         self.pulling = False
+        self.rotation.reset()
         self.cmd_pub.publish(Twist())
 
     def on_shutdown(self):
