@@ -129,7 +129,8 @@ class MagneticCmdVelNode:
         # 前後 (base_frame の x) 方向だけに掛けるゲイン. 実機テストで手首が前後には
         # 左右より傾きにくく, 同じように引いても速度が左右の約 0.7 倍だったため 1.5 倍にする
         self.gain_x = rospy.get_param('~gain_x', 1.5)
-        self.max_linear_vel = rospy.get_param('~max_linear_vel', 0.4)  # m/s
+        # 11/17: 回転だけを試すため既定は 0 (引きで動かない). 引きで動かすなら 0.4
+        self.max_linear_vel = rospy.get_param('~max_linear_vel', 0.0)  # m/s
         # 全方向台車なら True (横に引くと横へ動く). False なら横に引くと旋回する
         self.allow_lateral = rospy.get_param('~allow_lateral', True)
         self.max_angular_vel = rospy.get_param('~max_angular_vel', 0.7)  # rad/s (allow_lateral=False 時)
@@ -153,16 +154,17 @@ class MagneticCmdVelNode:
         self.enable_body_rotation = rospy.get_param('~enable_body_rotation', True)
         self.body_yaw_topic = rospy.get_param('~body_yaw_topic', '/human_body_yaw/body_pose')
         self.body_yaw_timeout = rospy.get_param('~body_yaw_timeout', 0.5)  # s (受信からの経過)
-        self.rotation_center = rospy.get_param('~rotation_center', 'hand')  # 'hand' or 'base'
+        self.rotation_center = rospy.get_param('~rotation_center', 'base')  # 'hand' or 'base'
         # 並進 (引き + 回転の補正) の合計の上限
         self.max_total_linear_vel = rospy.get_param('~max_total_linear_vel', 0.5)  # m/s
+        # 既定は 11/17 の実機試行で使った値
         self.rotation = BodyYawRotation(
-            start_angle=math.radians(rospy.get_param('~rot_start_angle', 15.0)),
-            stop_angle=math.radians(rospy.get_param('~rot_stop_angle', 5.0)),
-            start_delay=rospy.get_param('~rot_start_delay', 0.5),
-            gain=rospy.get_param('~rot_gain', 1.0),                  # (rad/s) / rad
-            max_vel=rospy.get_param('~max_rot_vel', 0.35),           # rad/s
-            max_accel=rospy.get_param('~max_rot_accel', 0.5))        # rad/s^2
+            start_angle=math.radians(rospy.get_param('~rot_start_angle', 8.0)),
+            stop_angle=math.radians(rospy.get_param('~rot_stop_angle', 3.0)),
+            start_delay=rospy.get_param('~rot_start_delay', 0.1),
+            gain=rospy.get_param('~rot_gain', 1.5),                  # (rad/s) / rad
+            max_vel=rospy.get_param('~max_rot_vel', 0.5),            # rad/s
+            max_accel=rospy.get_param('~max_rot_accel', 1.2))        # rad/s^2
         if self.enable_body_rotation and not self.allow_lateral:
             rospy.logwarn("enable_body_rotation needs allow_lateral=True "
                           "(the lateral pull is used for turning). Body rotation disabled.")
